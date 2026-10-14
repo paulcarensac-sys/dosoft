@@ -3,6 +3,7 @@ import win32con
 import ctypes
 import win32process
 import time
+from app_logging import logger
 
 class DofusLogic:
     def __init__(self, config):
@@ -89,6 +90,16 @@ class DofusLogic:
         leader_name = self.config.data.get("leader_name", "")
         for acc in self.all_accounts:
             if acc['name'] == leader_name: self.leader_hwnd = acc['hwnd']
+
+        logger.info("scan_slots (%s) : %d fenêtre(s) détectée(s)", game_version, len(self.all_accounts))
+        titres = dict(windows_trouvees)
+        for acc in self.all_accounts:
+            logger.info(
+                "  - %s | classe %s | %s | %s | hwnd %s | titre %r",
+                acc['name'], acc['classe'], "actif" if acc['active'] else "inactif", acc['team'], acc['hwnd'], titres.get(acc['hwnd'], "")
+            )
+        if leader_name:
+            logger.info("Chef : %s (%s)", leader_name, "trouvé" if self.leader_hwnd else "absent")
                 
         return self.all_accounts
 
@@ -180,6 +191,8 @@ class DofusLogic:
 
     def focus_window(self, hwnd):
         if not hwnd: return
+        name = next((acc['name'] for acc in self.all_accounts if acc['hwnd'] == hwnd), "?")
+        logger.info("Focus -> %s (hwnd %s)", name, hwnd)
         try:
             if win32gui.IsIconic(hwnd): win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             tid, pid = win32process.GetWindowThreadProcessId(hwnd)
@@ -187,7 +200,8 @@ class DofusLogic:
             ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
             ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
             win32gui.SetForegroundWindow(hwnd)
-        except: pass
+        except Exception:
+            logger.warning("Échec du focus sur %s (hwnd %s)", name, hwnd, exc_info=True)
 
     def sort_taskbar(self):
         active_accs = self.get_cycle_list()

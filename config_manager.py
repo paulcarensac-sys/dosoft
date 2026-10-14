@@ -1,5 +1,6 @@
 import json
 import os
+from app_logging import logger
 
 class Config:
     def __init__(self, filename="settings.json"):
@@ -42,13 +43,18 @@ class Config:
                 with open(self.filename, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
                     self.data.update(loaded)
-            except Exception: pass
+                logger.info("Configuration chargée : %s", os.path.abspath(self.filename))
+            except Exception:
+                logger.exception("Lecture de %s impossible, valeurs par défaut utilisées", os.path.abspath(self.filename))
+        else:
+            logger.info("Pas de %s, valeurs par défaut utilisées", os.path.abspath(self.filename))
 
     def save(self):
         try:
             with open(self.filename, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=4)
-        except Exception: pass
+        except Exception:
+            logger.exception("Écriture de %s impossible", os.path.abspath(self.filename))
             
     def reset_settings(self):
         if os.path.exists(self.filename):

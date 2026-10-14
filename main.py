@@ -1,5 +1,6 @@
 import os
 import sys
+import logging
 import ctypes
 import threading
 import keyboard
@@ -17,6 +18,7 @@ import asyncio
 import requests
 from tkinter import messagebox 
 from app_version import CURRENT_VERSION, APP_TITLE
+from app_logging import logger, setup_logging, log_throttled, log_exception_throttled
 
 # --- FORCAGE DU DPI AWARENESS (Règle les soucis 4K / Zoom Windows) ---
 try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -66,10 +68,16 @@ class OrganizerApp:
         try_load_windows_layout(self.config.data.get("keyboard_layout", "azerty_fr"))
         self.logic = DofusLogic(self.config)
         self.gui = OrganizerGUI(self)
+        default_report = self.gui.root.report_callback_exception
+        def report_tk_exception(exc_type, exc_value, exc_tb):
+            logger.error("Exception dans un callback Tkinter", exc_info=(exc_type, exc_value, exc_tb))
+            default_report(exc_type, exc_value, exc_tb)
+        self.gui.root.report_callback_exception = report_tk_exception
         self.current_idx = 0
-        self.hotkey_actions = {} 
+        self.hotkey_actions = {}
         self.mouse_hotkeys = {}
         self.mouse_states = {}
+        self.hotkey_labels = {}
         
         self.radial_focus = RadialMenu(self.gui.root, self.on_radial_focus_select, accent_color="#2ecc71", hover_color="#27ae60", center_icon_path="skin/character.png")
         
@@ -248,6 +256,7 @@ class OrganizerApp:
                     
                     if is_pressed and not was_pressed:
                         self.mouse_states[hk_str] = True
+                        logger.info("Raccourci souris déclenché : %s -> %s", hk_str, self.hotkey_labels.get(hk_str, "?"))
                         def safe_mouse_execute(f=func):
                             self.release_modifiers()
                             f()
@@ -281,6 +290,7 @@ class OrganizerApp:
                             break
                             
                     x, y = win32api.GetCursorPos()
+                    logger.info("Menu radial ouvert (%d perso(s), actif : %s)", len(active_accs), current_name)
                     self.gui.root.after(0, self.radial_focus.show, x, y, active_accs, current_name)
                     
                 elif radial_was_open and not is_pressed:
@@ -295,12 +305,15 @@ class OrganizerApp:
                     for index, acc in enumerate(cycle_list):
                         if acc['hwnd'] == fg_hwnd:
                             if self.current_idx != index:
+                                logger.info("Focus manuel détecté : %s (position %d)", acc['name'], index + 1)
                                 self.current_idx = index
                             break
-            except Exception: pass
+            except Exception:
+                log_exception_throttled("sync_focus", "Erreur pendant la synchronisation du focus")
             time.sleep(0.01)
 
     def on_radial_focus_select(self, target_name):
+        logger.info("Menu radial : sélection de %s", target_name)
         for acc in self.logic.all_accounts:
             if acc['name'] == target_name:
                 self.logic.focus_window(acc['hwnd'])
@@ -312,12 +325,15 @@ class OrganizerApp:
                 self.current_idx = index
                 break
 
-    def register_action(self, hk_str, func):
+    def register_action(self, hk_str, func, label=None):
         if not hk_str: return
         hk_str = hk_str.lower().strip()
-        
+        label = label or getattr(func, "__name__", "?")
+
         if 'click' in hk_str or 'mouse' in hk_str:
             self.mouse_hotkeys[hk_str] = func
+            self.hotkey_labels[hk_str] = label
+            logger.info("Raccourci souris enregistré : %s -> %s", hk_str, label)
             return
             
         parts = hk_str.split('+')
@@ -330,6 +346,10 @@ class OrganizerApp:
             main_scan = self.keymaps.resolve_scan_code(p)
         if main_scan is not None:
             self.hotkey_actions[(frozenset(mods), main_scan)] = func
+            self.hotkey_labels[(frozenset(mods), main_scan)] = f"{hk_str} -> {label}"
+            logger.info("Raccourci clavier enregistré : %s -> %s (scan code %s)", hk_str, label, main_scan)
+        else:
+            logger.warning("Raccourci non reconnu, ignoré : %s -> %s", hk_str, label)
 
     def _execute_advanced_and_update(self, mode, identifier):
         new_idx = self.logic.execute_advanced_bind(mode, identifier)
@@ -352,6 +372,14 @@ class OrganizerApp:
         except: pass
 
     def global_hook_listener(self, event):
+        try:
+            self._handle_hook_event(event)
+        except Exception:
+            # La lib keyboard intercepte déjà l'exception (traceback sur stderr) : on la journalise avant.
+            logger.exception("Erreur dans le hook clavier")
+            raise
+
+    def _handle_hook_event(self, event):
         if event.event_type != keyboard.KEY_DOWN: return
         
         current_mods = set()
@@ -361,9 +389,11 @@ class OrganizerApp:
         
         key = (frozenset(current_mods), event.scan_code)
         if key in self.hotkey_actions:
+            # Seuls les raccourcis reconnus sont journalisés, jamais les autres touches.
+            logger.info("Raccourci déclenché : %s", self.hotkey_labels.get(key, "?"))
             def safe_execute(mods=current_mods):
                 self.release_modifiers()
-                self.hotkey_actions[key]()
+                self.hotkey_actions[key]()  # une exception ici est journalisée par threading.excepthook
                 time.sleep(0.05)
                 self.restore_modifiers(mods)
             threading.Thread(target=safe_execute, daemon=True).start()
@@ -371,33 +401,40 @@ class OrganizerApp:
     def setup_hotkeys(self):
         keyboard.unhook_all()
         self.hotkey_actions = {} 
-        self.mouse_hotkeys = {} 
-        self.mouse_states = {}  
-        
+        self.mouse_hotkeys = {}
+        self.mouse_states = {}
+        self.hotkey_labels = {}
+
         cfg = self.config.data
-        
+
         # Binds avancés dynamiques
         mode = cfg.get("advanced_bind_mode", "cycle")
+        logger.info("Configuration des raccourcis (mode avancé : %s, disposition : %s)", mode, cfg.get("keyboard_layout", "azerty_fr"))
         if mode == "cycle":
             row_binds = cfg.get("cycle_row_binds", [])
             for index, bind_str in enumerate(row_binds):
                 if bind_str:
-                    self.register_action(bind_str, lambda idx=index: self._execute_advanced_and_update("cycle", idx))
+                    self.register_action(bind_str, lambda idx=index: self._execute_advanced_and_update("cycle", idx), f"position {index + 1}")
         elif mode == "bind":
             char_binds = cfg.get("persistent_character_binds", {})
             for pseudo, bind_str in char_binds.items():
                 if bind_str:
-                    self.register_action(bind_str, lambda ps=pseudo: self._execute_advanced_and_update("bind", ps))
-                    
+                    self.register_action(bind_str, lambda ps=pseudo: self._execute_advanced_and_update("bind", ps), f"perso {pseudo}")
+
         try:
             if cfg.get("prev_key"): self.register_action(cfg["prev_key"], self.prev_char)
             if cfg.get("next_key"): self.register_action(cfg["next_key"], self.next_char)
             if cfg.get("leader_key"): self.register_action(cfg["leader_key"], self.focus_leader)
-            if cfg.get("toggle_app_key"): self.register_action(cfg["toggle_app_key"], lambda: self.gui.root.after(0, self.gui.toggle_visibility))
+            if cfg.get("toggle_app_key"): self.register_action(cfg["toggle_app_key"], lambda: self.gui.root.after(0, self.gui.toggle_visibility), "toggle_app")
             if cfg.get('refresh_key'): self.register_action(cfg['refresh_key'], self.refresh)
-            if cfg.get('quit_key'):    self.register_action(cfg['quit_key'],   self.quit_app) 
+            if cfg.get('quit_key'):    self.register_action(cfg['quit_key'],   self.quit_app)
             keyboard.hook(self.global_hook_listener)
-        except Exception: pass
+        except Exception:
+            logger.exception("Erreur pendant l'enregistrement des raccourcis")
+        logger.info(
+            "Menu radial : %s (raccourci : %s)",
+            "actif" if cfg.get("radial_menu_active", True) else "inactif", cfg.get("radial_menu_hotkey", "")
+        )
 
     def refresh(self): 
         slots = self.logic.scan_slots()
@@ -431,6 +468,7 @@ class OrganizerApp:
 
     def start_notification_listener(self):
         if not WINSDK_AVAILABLE:
+            logger.info("Moteur de notifications indisponible (ni winrt ni winsdk)")
             return
 
         def run_async_loop():
@@ -438,7 +476,7 @@ class OrganizerApp:
                 import pythoncom
                 pythoncom.CoInitializeEx(0, pythoncom.COINIT_MULTITHREADED)
             except Exception:
-                pass
+                logger.warning("CoInitializeEx a échoué", exc_info=True)
 
             mode = self.config.data.get("notif_api_mode", "v2")
             if mode == "v1":
@@ -447,6 +485,7 @@ class OrganizerApp:
                 engine = self._poll_notifications_v3
             else:
                 engine = self._poll_notifications_v2
+            logger.info("Moteur de notifications démarré (%s)", mode)
 
             while True:
                 loop = asyncio.new_event_loop()
@@ -454,7 +493,7 @@ class OrganizerApp:
                 try:
                     loop.run_until_complete(engine())
                 except Exception:
-                    pass
+                    log_exception_throttled("notif_loop", "Le moteur de notifications s'est arrêté, relance dans 3 s")
                 finally:
                     try:
                         loop.close()
@@ -470,6 +509,7 @@ class OrganizerApp:
                 listener = UserNotificationListener.current
                 access = await listener.request_access_async()
                 if access != 1:
+                    log_throttled("notif_access", logging.WARNING, "Accès aux notifications Windows refusé (statut %s)", access, interval=300)
                     await asyncio.sleep(5)
                     continue
 
@@ -497,20 +537,21 @@ class OrganizerApp:
                                                 cycle_list = self.logic.get_cycle_list()
                                                 for index, acc in enumerate(cycle_list):
                                                     if acc['name'] == pseudo:
+                                                        logger.info("Notification Rétro : focus sur %s", pseudo)
                                                         self.gui.root.after(0, self.logic.focus_window, acc['hwnd'])
                                                         self.current_idx = index
                                                         break
                                                 break
                                     except Exception:
-                                        pass
+                                        log_exception_throttled("notif_parse", "Notification illisible")
 
                         seen_ids.intersection_update(current_ids)
                         first_pass = False
                     except Exception:
-                        pass
+                        log_exception_throttled("notif_poll", "Erreur pendant la lecture des notifications")
                     await asyncio.sleep(0.5)
             except Exception:
-                pass
+                log_exception_throttled("notif_listener", "Erreur du moteur de notifications")
             await asyncio.sleep(3)
 
     # ==========================================
@@ -522,6 +563,7 @@ class OrganizerApp:
                 listener = UserNotificationListener.current
                 access = await listener.request_access_async()
                 if access != 1:
+                    log_throttled("notif_access", logging.WARNING, "Accès aux notifications Windows refusé (statut %s)", access, interval=300)
                     await asyncio.sleep(5)
                     continue
 
@@ -533,7 +575,7 @@ class OrganizerApp:
                     try:
                         listener.remove_notification(notif_id)
                     except Exception:
-                        pass
+                        log_exception_throttled("notif_remove", "Impossible de retirer la notification")
 
                 while True:
                     try:
@@ -558,6 +600,7 @@ class OrganizerApp:
                                                 cycle_list = self.logic.get_cycle_list()
                                                 for index, acc in enumerate(cycle_list):
                                                     if acc['name'] == pseudo:
+                                                        logger.info("Notification Rétro : focus sur %s", pseudo)
                                                         self.gui.root.after(0, self.logic.focus_window, acc['hwnd'])
                                                         self.current_idx = index
                                                         break
@@ -565,15 +608,15 @@ class OrganizerApp:
                                         if is_dofus_notif:
                                             asyncio.create_task(remove_notif_delayed(n.id))
                                     except Exception:
-                                        pass
+                                        log_exception_throttled("notif_parse", "Notification illisible")
 
                         seen_ids.intersection_update(current_ids)
                         first_pass = False
                     except Exception:
-                        pass
+                        log_exception_throttled("notif_poll", "Erreur pendant la lecture des notifications")
                     await asyncio.sleep(0.5)
             except Exception:
-                pass
+                log_exception_throttled("notif_listener", "Erreur du moteur de notifications")
             await asyncio.sleep(3)
 
     # ==========================================
@@ -585,6 +628,7 @@ class OrganizerApp:
                 listener = UserNotificationListener.current
                 access = await listener.request_access_async()
                 if access != 1:
+                    log_throttled("notif_access", logging.WARNING, "Accès aux notifications Windows refusé (statut %s)", access, interval=300)
                     await asyncio.sleep(5)
                     continue
 
@@ -609,21 +653,22 @@ class OrganizerApp:
                                                 pseudo = t.text.split(" - ")[0].strip()
                                                 for index, acc in enumerate(self.logic.get_cycle_list()):
                                                     if acc['name'] == pseudo:
+                                                        logger.info("Notification Rétro : focus sur %s", pseudo)
                                                         self.gui.root.after(0, self.logic.focus_window, acc['hwnd'])
                                                         self.current_idx = index
                                                         break
                                                 break
                                     except Exception:
-                                        pass
+                                        log_exception_throttled("notif_parse", "Notification illisible")
 
                         seen_ids.intersection_update(current_ids)
                     except Exception:
-                        pass
+                        log_exception_throttled("notif_poll", "Erreur pendant la lecture des notifications")
 
                     first_pass = False
                     await asyncio.sleep(0.3)
             except Exception:
-                pass
+                log_exception_throttled("notif_listener", "Erreur du moteur de notifications")
             await asyncio.sleep(3)
                 
 
@@ -655,8 +700,10 @@ def check_version(i18n=None):
         response.raise_for_status() 
         data = response.json()
         latest_version = data.get("version")
+        newer = bool(latest_version and is_newer_version(latest_version, CURRENT_VERSION))
+        logger.info("Vérification de version : locale %s, upstream %s, mise à jour : %s", CURRENT_VERSION, latest_version, newer)
 
-        if latest_version and is_newer_version(latest_version, CURRENT_VERSION):
+        if newer:
             message = i18n.t(
                 "version_update_required_text",
                 "Une mise à jour est requise pour utiliser le logiciel.\n\nVotre version : {current_version}\nVersion disponible : {latest_version}\n\nMise à jour dispo sur Dosoft.fr"
@@ -668,25 +715,34 @@ def check_version(i18n=None):
                 0x10
             )
     except requests.RequestException:
+        logger.warning("Vérification de version impossible", exc_info=True)
         ctypes.windll.user32.MessageBoxW(
             0,
             i18n.t("version_network_error_text", "Impossible de vérifier la version."),
             i18n.t("version_network_error_title", "Erreur réseau"),
             0x10
         )
-        
+    except Exception:
+        logger.exception("Erreur inattendue pendant la vérification de version")
+        raise
+
 
 def is_admin():
     try: return ctypes.windll.shell32.IsUserAnAdmin()
     except: return False
 
 def run_as_admin():
+    # skin/, sounds/, logo.ico et settings.json sont lus relativement au dossier de travail :
+    # on le transmet explicitement au processus élevé.
     if getattr(sys, 'frozen', False):
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv[1:]), None, 1)
+        work_dir = os.getcwd()
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv[1:]), work_dir, 1)
     else:
         script = os.path.abspath(sys.argv[0])
+        work_dir = os.path.dirname(script)
         params = ' '.join([f'"{arg}"' for arg in sys.argv[1:]])
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{script}" {params}', None, 1)
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{script}" {params}', work_dir, 1)
+    logger.info("Relance en administrateur (dossier de travail : %s, code ShellExecute : %s)", work_dir, ret)
 
 def handle_multiple_instances():
     i18n = I18nManager(Config().data.get("language", "fr"))
@@ -715,6 +771,11 @@ def handle_multiple_instances():
     return mutex
 
 def start_application():
+    setup_logging()
+    logger.info(
+        "Démarrage de %s (compilé : %s, admin : %s, Python %s, dossier : %s)",
+        APP_TITLE, getattr(sys, 'frozen', False), bool(is_admin()), sys.version.split()[0], os.getcwd()
+    )
     if not is_admin():
         run_as_admin()
         sys.exit() 

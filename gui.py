@@ -12,6 +12,7 @@ from PIL import Image, ImageTk
 from i18n_manager import I18nManager
 from config_manager import Config
 from app_version import APP_TITLE
+from app_logging import logger
 
 
 ctk.set_appearance_mode("Dark")  
@@ -286,6 +287,7 @@ class OrganizerGUI:
         self.lbl_feedback.pack(expand=True)
         
         self.skin_cache = {} 
+        self.missing_skins = set()
 
     def apply_translations(self):
         none_label = self.app.i18n.t("none", "Aucun")
@@ -639,7 +641,11 @@ class OrganizerGUI:
         filename = f"{class_name}_retro" if is_retro and class_name != "Inconnu" else class_name
         if filename in self.skin_cache: return self.skin_cache[filename]
         path = f"skin/{filename}.png"
-        if not os.path.exists(path): return None
+        if not os.path.exists(path):
+            if filename not in self.missing_skins:
+                self.missing_skins.add(filename)
+                logger.warning("Icône de classe introuvable : %s", os.path.abspath(path))
+            return None
         img = ctk.CTkImage(light_image=Image.open(path), dark_image=Image.open(path), size=(24, 24))
         self.skin_cache[filename] = img
         return img
