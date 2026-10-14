@@ -29,7 +29,12 @@ try:
     from winrt.windows.ui.notifications import NotificationKinds
     WINSDK_AVAILABLE = True
 except ImportError:
-    WINSDK_AVAILABLE = False
+    try:
+        from winsdk.windows.ui.notifications.management import UserNotificationListener
+        from winsdk.windows.ui.notifications import NotificationKinds
+        WINSDK_AVAILABLE = True
+    except ImportError:
+        WINSDK_AVAILABLE = False
 
 from config_manager import Config
 from logic import DofusLogic
