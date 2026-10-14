@@ -1,5 +1,7 @@
 import win32gui
 import win32con
+import win32api
+import win32clipboard
 import ctypes
 import win32process
 import time
@@ -202,6 +204,91 @@ class DofusLogic:
             win32gui.SetForegroundWindow(hwnd)
         except Exception:
             logger.warning("Échec du focus sur %s (hwnd %s)", name, hwnd, exc_info=True)
+
+    def _focus_and_wait(self, hwnd, timeout=1.0):
+        """ Met la fenêtre au premier plan et attend qu'elle le soit vraiment. """
+        self.focus_window(hwnd)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if win32gui.GetForegroundWindow() == hwnd:
+                time.sleep(0.15)  # laisse le jeu traiter la prise de focus
+                return True
+            time.sleep(0.02)
+        logger.warning("La fenêtre (hwnd %s) n'est pas passée au premier plan, action annulée", hwnd)
+        return False
+
+    def get_invitees(self):
+        """ Persos à inviter : actifs dans la liste, hors chef et hors pages de connexion. """
+        leader_name = self.config.data.get("leader_name", "")
+        return [acc for acc in self.get_cycle_list() if acc['name'] != leader_name and not acc.get('is_menu')]
+
+    def _tap_key(self, vk):
+        scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
+        win32api.keybd_event(vk, scan, 0, 0)
+        time.sleep(0.02)
+        win32api.keybd_event(vk, scan, win32con.KEYEVENTF_KEYUP, 0)
+
+    def _set_clipboard_text(self, text):
+        for _ in range(10):
+            try:
+                win32clipboard.OpenClipboard()
+            except Exception:
+                time.sleep(0.05)
+                continue
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
+                return True
+            finally:
+                win32clipboard.CloseClipboard()
+        logger.warning("Presse-papier indisponible, commande non envoyée")
+        return False
+
+    def send_chat_command(self, hwnd, text):
+        """ Ouvre le chat (Espace), colle la commande et la valide (Entrée). """
+        if not self._focus_and_wait(hwnd): return False
+        if not self._set_clipboard_text(text): return False
+        self._tap_key(win32con.VK_SPACE)
+        time.sleep(0.15)
+        ctrl_scan = ctypes.windll.user32.MapVirtualKeyW(win32con.VK_CONTROL, 0)
+        win32api.keybd_event(win32con.VK_CONTROL, ctrl_scan, 0, 0)
+        self._tap_key(ord('V'))
+        win32api.keybd_event(win32con.VK_CONTROL, ctrl_scan, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.15)
+        self._tap_key(win32con.VK_RETURN)
+        logger.info("Commande envoyée dans le chat : %s", text)
+        return True
+
+    def click_relative(self, hwnd, rx, ry):
+        """ Clique à une position exprimée en proportion de la zone de jeu, puis remet la souris en place. """
+        if not self._focus_and_wait(hwnd): return False
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        x, y = win32gui.ClientToScreen(hwnd, (int((right - left) * rx), int((bottom - top) * ry)))
+        old_pos = win32api.GetCursorPos()
+        win32api.SetCursorPos((x, y))
+        time.sleep(0.05)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.05)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(0.05)
+        win32api.SetCursorPos(old_pos)
+        logger.info("Clic à (%.3f, %.3f) de la zone de jeu (écran %d, %d)", rx, ry, x, y)
+        return True
+
+    def capture_relative_cursor(self):
+        """ Position de la souris en proportion de la zone de jeu de la fenêtre Dofus au premier plan. """
+        hwnd = win32gui.GetForegroundWindow()
+        if not any(acc['hwnd'] == hwnd for acc in self.all_accounts):
+            logger.warning("Calibrage ignoré : la fenêtre au premier plan n'est pas une fenêtre Dofus connue")
+            return None
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        width, height = right - left, bottom - top
+        if width <= 0 or height <= 0: return None
+        cx, cy = win32gui.ScreenToClient(hwnd, win32api.GetCursorPos())
+        if not (0 <= cx < width and 0 <= cy < height):
+            logger.warning("Calibrage ignoré : la souris est hors de la zone de jeu")
+            return None
+        return [round(cx / width, 4), round(cy / height, 4)]
 
     def sort_taskbar(self):
         active_accs = self.get_cycle_list()

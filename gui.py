@@ -233,6 +233,9 @@ class OrganizerGUI:
         self.create_hotkey_row(self.frame_keys, "hotkey_toggle_ui", "toggle_app_key", 2, 3, "tooltip_toggle_ui")
         self.create_hotkey_row(self.frame_keys, "hotkey_refresh", "refresh_key", 1, 6, "tooltip_refresh")
         self.create_hotkey_row(self.frame_keys, "hotkey_quit", "quit_key", 2, 6, "tooltip_quit")
+        self.create_hotkey_row(self.frame_keys, "hotkey_invite_group", "invite_group_key", 3, 0, "tooltip_invite_group")
+        self.create_hotkey_row(self.frame_keys, "hotkey_accept_invite", "accept_invite_key", 3, 3, "tooltip_accept_invite")
+        self.create_hotkey_row(self.frame_keys, "hotkey_calibrate_accept", "calibrate_accept_key", 3, 6, "tooltip_calibrate_accept")
 
         self.frame_actions = ctk.CTkFrame(self.root)
         self.frame_actions.pack(fill="x", padx=15, pady=5)
