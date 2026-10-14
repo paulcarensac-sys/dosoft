@@ -5,6 +5,7 @@ import ctypes
 import threading
 import keyboard
 import time
+import winsound
 import win32api
 import win32con
 import win32gui
@@ -74,6 +75,7 @@ class OrganizerApp:
             default_report(exc_type, exc_value, exc_tb)
         self.gui.root.report_callback_exception = report_tk_exception
         self.current_idx = 0
+        self.accept_idx = 0
         self.hotkey_actions = {}
         self.mouse_hotkeys = {}
         self.mouse_states = {}
@@ -428,6 +430,9 @@ class OrganizerApp:
             if cfg.get("toggle_app_key"): self.register_action(cfg["toggle_app_key"], lambda: self.gui.root.after(0, self.gui.toggle_visibility), "toggle_app")
             if cfg.get('refresh_key'): self.register_action(cfg['refresh_key'], self.refresh)
             if cfg.get('quit_key'):    self.register_action(cfg['quit_key'],   self.quit_app)
+            if cfg.get('invite_group_key'):    self.register_action(cfg['invite_group_key'], self.invite_group)
+            if cfg.get('accept_invite_key'):   self.register_action(cfg['accept_invite_key'], self.accept_next_invite)
+            if cfg.get('calibrate_accept_key'): self.register_action(cfg['calibrate_accept_key'], self.calibrate_accept_button)
             keyboard.hook(self.global_hook_listener)
         except Exception:
             logger.exception("Erreur pendant l'enregistrement des raccourcis")
@@ -461,6 +466,55 @@ class OrganizerApp:
         if not cycle_list: return
         self.current_idx = (self.current_idx - 1) % len(cycle_list)
         self.logic.focus_window(cycle_list[self.current_idx]['hwnd'])
+
+    def invite_group(self):
+        """ Envoie dans le chat du chef une invitation pour chaque autre perso actif. """
+        if not self.logic.leader_hwnd:
+            logger.warning("Invitation de groupe : aucun chef défini ou fenêtre du chef absente")
+            return
+        invitees = self.logic.get_invitees()
+        if not invitees:
+            logger.warning("Invitation de groupe : aucun perso à inviter")
+            return
+        command = " ; ".join(f"/invite {acc['name']}" for acc in invitees)
+        if self.logic.send_chat_command(self.logic.leader_hwnd, command):
+            self.accept_idx = 0
+            leader_name = self.config.data.get("leader_name", "")
+            for index, acc in enumerate(self.logic.get_cycle_list()):
+                if acc['name'] == leader_name:
+                    self.current_idx = index
+                    break
+
+    def accept_next_invite(self):
+        """ Passe sur le perso invité suivant et clique sur le bouton Accepter calibré. """
+        invitees = self.logic.get_invitees()
+        if not invitees:
+            logger.warning("Accepter invitation : aucun perso invité")
+            return
+        target = invitees[self.accept_idx % len(invitees)]
+        self.accept_idx = (self.accept_idx % len(invitees)) + 1
+        for index, acc in enumerate(self.logic.get_cycle_list()):
+            if acc['name'] == target['name']:
+                self.current_idx = index
+                break
+        pos = self.config.data.get("accept_button_pos")
+        if not pos:
+            logger.warning("Bouton Accepter non calibré : focus seul sur %s", target['name'])
+            self.logic.focus_window(target['hwnd'])
+            return
+        logger.info("Acceptation de l'invitation pour %s", target['name'])
+        self.logic.click_relative(target['hwnd'], pos[0], pos[1])
+
+    def calibrate_accept_button(self):
+        """ Mémorise la position de la souris (sur le bouton Accepter) en proportion de la fenêtre. """
+        pos = self.logic.capture_relative_cursor()
+        if not pos:
+            winsound.MessageBeep(winsound.MB_ICONHAND)
+            return
+        self.config.data["accept_button_pos"] = pos
+        self.config.save()
+        logger.info("Bouton Accepter calibré à (%.3f, %.3f) de la zone de jeu", pos[0], pos[1])
+        winsound.MessageBeep(winsound.MB_OK)
 
     def quit_app(self):
         my_pid = os.getpid()
